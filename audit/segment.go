@@ -1,7 +1,7 @@
 package audit
 
 import (
-	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,12 +15,13 @@ import (
 
 // Segment 描述一个日志段落的元数据。
 type Segment struct {
-	ID       int       `json:"id"`
-	Events   int       `json:"events"`
-	Hash     string    `json:"hash"`      // 本段文件内容的 SHA-256
-	PrevHash string    `json:"prev_hash"` // 前一封存段的哈希，构成链
-	SealedAt time.Time `json:"sealed_at"`
-	FileName string    `json:"file_name"`
+	ID          int       `json:"id"`
+	Events      int       `json:"events"`
+	Hash        string    `json:"hash"`         // 本段文件内容的 SHA-256
+	PrevHash    string    `json:"prev_hash"`    // 前一封存段的哈希，构成链
+	BatchAnchor string    `json:"batch_anchor"` // 本段首批提交标记的 prev_digest（段内摘要链起点）
+	SealedAt    time.Time `json:"sealed_at"`
+	FileName    string    `json:"file_name"`
 }
 
 // RotationPolicy 控制何时轮转段落。
@@ -29,15 +30,17 @@ type RotationPolicy struct {
 	MaxAge   time.Duration // 段落最大时间跨度（按事件时间戳），0 表示不按时间轮转
 }
 
-// RetentionPolicy 控制保留策略。
+// RetentionPolicy 控制保留策略。三个维度同时生效，删除的仍是最旧连续前缀。
 type RetentionPolicy struct {
 	MaxSegments int           // 最多保留的已封存段落数，0 表示不限
 	MaxAge      time.Duration // 已封存段落最大保留时长（相对 SealedAt），0 表示不限
+	MaxBytes    int64         // 已封存段落总占用字节上限，超出则从最旧段开始删除，0 表示不限
 }
 
 // manifest 是落盘的段落清单。
 type manifest struct {
-	Segments []Segment `json:"segments"`
+	Segments   []Segment `json:"segments"`
+	LastDigest string    `json:"last_digest,omitempty"` // 最近一次成组提交的摘要（摘要链锚点）
 }
 
 // Store 管理段落文件的写入、轮转、保留与读取。
@@ -55,18 +58,30 @@ type Store struct {
 	activeCount int
 	activeStart time.Time // 活跃段首条事件时间戳
 	usedBytes   int64
+
+	lastSeqs    map[string]uint64 // 恢复得到的各来源已提交最大序号（供 Writer 续写）
+	lastDigest  string            // 最近一批的摘要（摘要链锚点）
+	batchAnchor string            // 当前活跃段首批的 prev_digest 锚点
+	recovery    RecoveryReport    // 打开时的崩溃恢复对账结果
 }
 
 // NewStore 创建或打开存储。maxBytes 为总容量上限（0 不限）。
 // 若目录下已有清单与段落文件，则加载之（支持重启后继续校验）。
 func NewStore(dir string, rot RotationPolicy, ret RetentionPolicy, maxBytes int64) (*Store, error) {
-	if rot.MaxBytes < 0 || rot.MaxAge < 0 || ret.MaxSegments < 0 || ret.MaxAge < 0 || maxBytes < 0 {
+	if rot.MaxBytes < 0 || rot.MaxAge < 0 || ret.MaxSegments < 0 || ret.MaxAge < 0 || ret.MaxBytes < 0 || maxBytes < 0 {
 		return nil, fmt.Errorf("%w: negative store policy value", ErrValidation)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, rot: rot, ret: ret, maxBytes: maxBytes, activeID: 1}
+	s := &Store{
+		dir:      dir,
+		rot:      rot,
+		ret:      ret,
+		maxBytes: maxBytes,
+		activeID: 1,
+		lastSeqs: map[string]uint64{},
+	}
 	// 加载已有清单。
 	data, err := os.ReadFile(s.manifestPath())
 	if err == nil {
@@ -75,21 +90,26 @@ func NewStore(dir string, rot RotationPolicy, ret RetentionPolicy, maxBytes int6
 			return nil, fmt.Errorf("load manifest: %w", err)
 		}
 		s.sealed = m.Segments
+		s.lastDigest = m.LastDigest
 		if len(s.sealed) > 0 {
 			s.activeID = s.sealed[len(s.sealed)-1].ID + 1
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	// 统计磁盘占用。
+	// 从已封存段重建各来源序号快照（封存段受哈希保护，损坏处保守停止）。
+	s.rebuildSealedSeqsLocked()
+	// 恢复活跃段：重放已确认批次、丢弃半成品并截断坏尾，回到可继续追加的正常状态。
+	rep, err := s.recoverActiveLocked()
+	if err != nil {
+		return nil, fmt.Errorf("recover active segment: %w", err)
+	}
+	s.recovery = rep
+	// 统计已封存段磁盘占用（活跃段占用已在恢复阶段计入）。
 	for _, seg := range s.sealed {
 		if fi, err := os.Stat(s.segmentPath(seg.ID)); err == nil {
 			s.usedBytes += fi.Size()
 		}
-	}
-	if fi, err := os.Stat(s.segmentPath(s.activeID)); err == nil {
-		s.activeSize = fi.Size()
-		s.usedBytes += fi.Size()
 	}
 	return s, nil
 }
@@ -100,52 +120,39 @@ func segmentFileName(id int) string { return fmt.Sprintf("segment-%06d.jsonl", i
 
 func (s *Store) segmentPath(id int) string { return filepath.Join(s.dir, segmentFileName(id)) }
 
-// Append 追加一条事件，必要时先触发轮转。容量不足时返回 ErrCapacity。
+// Append 追加一条事件。单条事件即一个提交批次（事件行 + 提交标记），
+// 容量不足时返回 ErrCapacity。批量原子提交请用 WriteBatch。
 func (s *Store) Append(e Event) error {
-	line, err := json.Marshal(e)
-	if err != nil {
-		return fmt.Errorf("%w: marshal event: %v", ErrValidation, err)
-	}
-	line = append(line, '\n')
+	return s.WriteBatch([]Event{e})
+}
 
+// RecoveryReport 返回打开存储时崩溃恢复的对账结果。
+func (s *Store) RecoveryReport() RecoveryReport {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.recovery
+}
 
-	// 时间轮转：以事件时间戳衡量活跃段时间跨度，保证重放结果确定。
-	if s.rot.MaxAge > 0 && s.activeCount > 0 && e.Timestamp.Sub(s.activeStart) >= s.rot.MaxAge {
-		if err := s.sealLocked(e.Timestamp); err != nil {
-			return err
-		}
+// activeBatchAnchor 返回当前活跃段首批提交标记应有的 prev_digest 锚点：
+// 取最近封存段开启时记录的锚点（即该段之后、新段首批之前的摘要位置）。
+func (s *Store) activeBatchAnchor() string {
+	if len(s.sealed) > 0 {
+		// 最近封存段开启时的锚点是该段首批 prev；新活跃段紧接其后，
+		// 其首批 prev 等于封存段最后一批 digest——打开时由 lastDigest 体现。
+		return s.lastDigest
 	}
-	// 大小轮转。
-	if s.rot.MaxBytes > 0 && s.activeCount > 0 && s.activeSize+int64(len(line)) > s.rot.MaxBytes {
-		if err := s.sealLocked(e.Timestamp); err != nil {
-			return err
-		}
-	}
-	// 容量检查。
-	if s.maxBytes > 0 && s.usedBytes+int64(len(line)) > s.maxBytes {
-		return fmt.Errorf("%w: need %d bytes, used %d of %d", ErrCapacity, len(line), s.usedBytes, s.maxBytes)
-	}
+	return "" // 没有封存段，从头开始
+}
 
-	f, err := os.OpenFile(s.segmentPath(s.activeID), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
+// SourceSeqs 返回恢复得到的各来源已提交最大序号快照。
+func (s *Store) SourceSeqs() map[string]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]uint64, len(s.lastSeqs))
+	for k, v := range s.lastSeqs {
+		out[k] = v
 	}
-	if _, err := f.Write(line); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if s.activeCount == 0 {
-		s.activeStart = e.Timestamp
-	}
-	s.activeSize += int64(len(line))
-	s.activeCount++
-	s.usedBytes += int64(len(line))
-	return nil
+	return out
 }
 
 // Seal 封存当前活跃段落。
@@ -169,22 +176,25 @@ func (s *Store) sealLocked(at time.Time) error {
 		prev = s.sealed[len(s.sealed)-1].Hash
 	}
 	s.sealed = append(s.sealed, Segment{
-		ID:       s.activeID,
-		Events:   s.activeCount,
-		Hash:     sum,
-		PrevHash: prev,
-		SealedAt: at,
-		FileName: segmentFileName(s.activeID),
+		ID:          s.activeID,
+		Events:      s.activeCount,
+		Hash:        sum,
+		PrevHash:    prev,
+		BatchAnchor: s.batchAnchor,
+		SealedAt:    at,
+		FileName:    segmentFileName(s.activeID),
 	})
 	s.activeID++
 	s.activeSize = 0
 	s.activeCount = 0
 	s.activeStart = time.Time{}
+	// 新活跃段首批的 prev_digest 锚点 = 刚封存段最后一批的摘要。
+	s.batchAnchor = s.lastDigest
 	return s.saveManifestLocked()
 }
 
 func (s *Store) saveManifestLocked() error {
-	data, err := json.MarshalIndent(manifest{Segments: s.sealed}, "", "  ")
+	data, err := json.MarshalIndent(manifest{Segments: s.sealed, LastDigest: s.lastDigest}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -192,46 +202,21 @@ func (s *Store) saveManifestLocked() error {
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.manifestPath())
+	if err := os.Rename(tmp, s.manifestPath()); err != nil {
+		return err
+	}
+	fsyncDir(s.dir) // rename 是目录项变更，需 fsync 目录保证崩溃后生效
+	return nil
 }
 
-// ApplyRetention 按保留策略清理最旧的已封存段落，返回被删除的段落 ID。
+// ApplyRetention 按保留策略（数量 + 时间 + 空间）清理最旧连续前缀，返回被删除的段落 ID。
 // 只删除连续前缀，保证剩余段落哈希链连续。
+// 需要冲突告警/释放字节等可核对明细时，请用 ApplyRetentionDetailed 或 ApplyRetentionStrict。
 func (s *Store) ApplyRetention(now time.Time) ([]int, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	remove := 0
-	// 按数量：超出 MaxSegments 的最旧段落。
-	if s.ret.MaxSegments > 0 && len(s.sealed) > s.ret.MaxSegments {
-		remove = len(s.sealed) - s.ret.MaxSegments
-	}
-	// 按时间：SealedAt 早于 now-MaxAge 的连续前缀。
-	if s.ret.MaxAge > 0 {
-		cutoff := now.Add(-s.ret.MaxAge)
-		n := 0
-		for n < len(s.sealed) && s.sealed[n].SealedAt.Before(cutoff) {
-			n++
-		}
-		if n > remove {
-			remove = n
-		}
-	}
-	if remove == 0 {
-		return nil, nil
-	}
-	var removed []int
-	for _, seg := range s.sealed[:remove] {
-		if fi, err := os.Stat(s.segmentPath(seg.ID)); err == nil {
-			s.usedBytes -= fi.Size()
-		}
-		if err := os.Remove(s.segmentPath(seg.ID)); err != nil && !os.IsNotExist(err) {
-			return removed, err
-		}
-		removed = append(removed, seg.ID)
-	}
-	s.sealed = s.sealed[remove:]
-	return removed, s.saveManifestLocked()
+	res, err := s.applyRetentionLocked(now, false)
+	s.mu.Unlock()
+	return res.Removed, err
 }
 
 // Segments 返回当前全部已封存段落元数据。
@@ -258,26 +243,46 @@ func (s *Store) ReadEvents(segmentID int) ([]Event, error) {
 }
 
 func (s *Store) readEventsLocked(segmentID int) ([]Event, error) {
-	f, err := os.Open(s.segmentPath(segmentID))
+	var events []Event
+	data, err := os.ReadFile(s.segmentPath(segmentID))
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	var events []Event
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
+	pos := 0
+	for pos < len(data) {
+		nl := bytes.IndexByte(data[pos:], '\n')
+		var raw []byte
+		lastLine := false
+		if nl < 0 {
+			raw = data[pos:]
+			lastLine = true
+			pos = len(data)
+		} else {
+			raw = data[pos : pos+nl]
+			pos += nl + 1
+		}
+		if len(raw) == 0 {
 			continue
 		}
-		var e Event
-		if err := json.Unmarshal(line, &e); err != nil {
-			return nil, fmt.Errorf("segment %d: corrupt line: %w", segmentID, err)
+		isCommit, ev, _, derr := decodeRecordLine(raw)
+		if derr != nil {
+			// 坏行性质分类（关键信号是坏行是否文件最后一行且无换行）：
+			//  - 在文件末尾且没有换行收尾 => 写入被拦腰打断 => truncated
+			//  - 有完整换行收尾（语法错误、提交标记字段被改等）=> tampered
+			if lastLine {
+				return events, fmt.Errorf("%w: segment %d last record cut short (no trailing newline)",
+					ErrTruncatedRead, segmentID)
+			}
+			if isCommit {
+				return events, fmt.Errorf("segment %d: commit marker damaged: %w", segmentID, derr)
+			}
+			return events, fmt.Errorf("segment %d: corrupt event line: %w", segmentID, derr)
 		}
-		events = append(events, e)
+		if !isCommit {
+			events = append(events, ev)
+		}
 	}
-	return events, sc.Err()
+	return events, nil
 }
 
 // AllEvents 按段落顺序读取全部未清理事件（含活跃段）。

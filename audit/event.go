@@ -15,6 +15,8 @@ var (
 	ErrSourceClosed = errors.New("audit: source closed")
 	// ErrCapacity 存储容量受限，拒绝写入。
 	ErrCapacity = errors.New("audit: capacity exceeded")
+	// ErrTruncatedRead 读取时遇到尾部不可解析行（被截短），已解析前缀随结果返回。
+	ErrTruncatedRead = errors.New("audit: truncated read")
 )
 
 // Event 是一条审计事件。Seq 在同一 Source 内必须单调且连续（从 1 开始）。

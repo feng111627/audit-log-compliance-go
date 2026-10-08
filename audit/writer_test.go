@@ -126,8 +126,8 @@ func TestWriteFailureReasons(t *testing.T) {
 	if err := w.Write(good); !errors.Is(err, ErrSourceClosed) {
 		t.Fatalf("closed source: got %v, want ErrSourceClosed", err)
 	}
-	// 容量受限：容量只够一条事件。
-	small, err := NewStore(t.TempDir(), RotationPolicy{}, RetentionPolicy{}, 250)
+	// 容量受限：容量只够一条带提交标记的事件（格式开销按提交标记行计入）。
+	small, err := NewStore(t.TempDir(), RotationPolicy{}, RetentionPolicy{}, 600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestWriteFailureReasons(t *testing.T) {
 	if err := w2.Write(e2); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("capacity: got %v, want ErrCapacity", err)
 	}
-	// 容量拒绝后序号不前进，缩小事件后仍可写入。
+	// 容量拒绝后序号不前进，缩小事件后仍可写入（提交标记更短）。
 	e2small := Event{Source: "s", Seq: 2, Timestamp: baseTime(), Type: "login_failed"}
 	if err := w2.Write(e2small); err != nil {
 		t.Fatalf("retry after capacity rejection: %v", err)

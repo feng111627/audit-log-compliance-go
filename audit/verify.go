@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"errors"
 	"fmt"
 	"os"
 )
@@ -88,6 +89,9 @@ func verify(s *Store, afterID int) VerifyReport {
 		default:
 			events, rerr := s.ReadEvents(seg.ID)
 			switch {
+			case errors.Is(rerr, ErrTruncatedRead):
+				sr.Reason = ReasonTruncated
+				sr.Detail = fmt.Sprintf("%v (recovered %d of %d events)", rerr, len(events), seg.Events)
 			case rerr != nil:
 				sr.Reason = ReasonTampered
 				sr.Detail = fmt.Sprintf("unreadable content: %v", rerr)
