@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -126,11 +127,21 @@ func corruptSegment(t *testing.T, dir string, id int, mode string) {
 	path := filepath.Join(dir, segmentFileName(id))
 	switch mode {
 	case "tamper":
+		// 制造“内容被外部改动”：修改某条记录 actor 字段的值，保持行数与
+		// JSON 结构合法，仅使内容哈希不匹配（区别于 record_corrupt）。
 		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		data[len(data)/2] ^= 0xFF // 原地翻转一字节，保持行数不变
+		tampered := bytes.Replace(data, []byte(`"actor":"u"`), []byte(`"actor":"Z"`), 1)
+		if !bytes.Equal(tampered, data) {
+			if err := os.WriteFile(path, tampered, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+		// 兜底：翻转一个落在双引号字符串值内的字节，尽量保持 JSON 合法。
+		data[len(data)/2] ^= 0x01
 		if err := os.WriteFile(path, data, 0o644); err != nil {
 			t.Fatal(err)
 		}

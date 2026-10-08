@@ -19,6 +19,23 @@ func NewWriter(store *Store) *Writer {
 	return &Writer{store: store, lastSeq: map[string]uint64{}, closed: map[string]bool{}}
 }
 
+// NewWriterFromStore 基于已有存储创建写入器，并从存储中现存的事件
+// （含 NewStore 崩溃恢复后重放出的活跃段事件）重建各来源序号，
+// 使进程重启后可用正确的下一个序号继续追加，不会误判序号乱序。
+func NewWriterFromStore(store *Store) (*Writer, error) {
+	events, err := store.AllEvents()
+	if err != nil {
+		return nil, err
+	}
+	lastSeq := make(map[string]uint64, len(events))
+	for _, e := range events {
+		if e.Seq > lastSeq[e.Source] {
+			lastSeq[e.Source] = e.Seq
+		}
+	}
+	return &Writer{store: store, lastSeq: lastSeq, closed: map[string]bool{}}, nil
+}
+
 // Write 提交一条事件。返回值可用 errors.Is 区分：
 //   - ErrValidation：字段非法、序号重复或乱序（不污染已提交数据）
 //   - ErrSourceClosed：来源已关闭
